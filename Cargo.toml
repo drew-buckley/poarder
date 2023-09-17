@@ -1,0 +1,14 @@
+[package]
+name = "poarder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+quick-xml = "0.30"
+reqwest = "0.11"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "3.1", features = ["derive"] }
+log = "0.4"
+env_logger = "0.10"
+chrono = "0.4"
+futures = "*"
