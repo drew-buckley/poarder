@@ -13,19 +13,20 @@ use quick_xml::reader::Reader;
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
-    // URL to podcast RSS feed.
+    /// URL to podcast RSS feed.
     #[clap(short, long)]
     rss_url: String,
 
-    // Number of tokio tasks to use while performing downloads.
+    /// Number of tokio tasks to use while performing downloads.
     #[clap(short, long, default_value = "4")]
     task_count: usize,
 
-    // Use syslog.
+    /// Use syslog.
    #[clap(long, action)]
    syslog: bool
 }
 
+#[derive(Debug, Clone)]
 struct Episode {
     url: String,
     title: String,
@@ -66,9 +67,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bodies = stream::iter(episodes)
         .map(|episode| {
             let client = client.clone();
+            let episode_clone = episode.clone();
             tokio::spawn(async move {
                 let resp = client.get(episode.url).send().await?;
-                resp.bytes().await
+                let data = match resp.bytes().await {
+                    Ok(data) => data,
+                    Err(e) => return Err(e)
+                };
+                // Ok((episode.clone(), data))
+                Ok((episode_clone, data))
             })
         })
         .buffer_unordered(args.task_count);
@@ -76,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     bodies
         .for_each(|b| async {
             match b {
-                Ok(Ok(b)) => info!("Got {} bytes", b.len()),
+                Ok(Ok(b)) => {info!("Got {} bytes", b.1.len())},
                 Ok(Err(e)) => error!("Got a reqwest::Error: {}", e),
                 Err(e) => error!("Got a tokio::JoinError: {}", e),
             }
@@ -99,7 +106,6 @@ fn init_logging(use_syslog: bool) {
 }
 
 fn parse_rss(rss_xml: &str) -> Result<LinkedList<Episode>, Box<dyn Error>> {
-
     let mut reader = Reader::from_str(rss_xml);
     reader.trim_text(true);
 
@@ -190,7 +196,5 @@ fn parse_item(item_xml: &str) -> Result<Episode, Box<dyn Error>> {
 }
 
 fn parse_date_time(datetime_str: &str) -> Result<DateTime<FixedOffset>, ParseError> {
-    // let datetime_str = str::replace(datetime_str, " GMT", "");
-    // NaiveDateTime::parse_from_str(datetime_str.as_str(), "%a, %d %b %y %X")
     DateTime::parse_from_rfc2822(&datetime_str)
 }
