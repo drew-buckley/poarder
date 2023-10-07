@@ -1,8 +1,11 @@
 use futures::{stream, StreamExt};
 use clap::{Parser, error};
 use log::{debug, error, info, log_enabled, warn};
+use std::fs::{File, self};
 use std::io::Write;
 use std::collections::LinkedList;
+use std::path::Path;
+use bytes::Bytes;
 use std::{error::Error, fmt};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, FixedOffset};
 use chrono::format::ParseError;
@@ -17,9 +20,16 @@ struct Args {
     #[clap(short, long)]
     rss_url: String,
 
+    #[clap(long, action)]
+    replace_existing: bool,
+
     /// Number of tokio tasks to use while performing downloads.
     #[clap(short, long, default_value = "4")]
     task_count: usize,
+
+    /// Directory to save 
+    #[clap(short, long, default_value = ".")]
+    output_dir: String,
 
     /// Use syslog.
    #[clap(long, action)]
@@ -55,27 +65,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     init_logging(args.syslog);
 
+    info!("Downloading RSS feed");
     let rss_xml = reqwest::get(args.rss_url)
         .await?
         .text()
         .await?;
 
+    let rss_xml_clone = rss_xml.clone();
+    let output_path = Path::new(&args.output_dir.clone()).join("rss.xml");
+    tokio::spawn(async move {
+        info!("RSS --> {}", &output_path.to_str().unwrap());
+        let rss_file = File::options()
+            .write(true)
+            .create(true)
+            .open(output_path);
+        let mut rss_file = match rss_file {
+            Ok(file) => file,
+            Err(e) => {
+                error!("Got I/O error: {}", e);
+                return
+            }
+        };
+
+        if let Err(e) = rss_file.write(rss_xml_clone.as_bytes()) {
+            error!("Failed to write RSS XML")
+        }
+    });
+
     let episodes = parse_rss(&rss_xml).unwrap();
 
+    info!("Downloading {} episodes with {} tasks", episodes.len(), args.task_count);
     let client = reqwest::Client::new();
-
     let bodies = stream::iter(episodes)
         .map(|episode| {
             let client = client.clone();
             let episode_clone = episode.clone();
+            let output_dir_clone = args.output_dir.clone();
             tokio::spawn(async move {
-                let resp = client.get(episode.url).send().await?;
-                let data = match resp.bytes().await {
-                    Ok(data) => data,
-                    Err(e) => return Err(e)
-                };
-                // Ok((episode.clone(), data))
-                Ok((episode_clone, data))
+                let (_, name_with_true_ext) = episode_to_filename(&episode);
+                let output_path_true = Path::new(&output_dir_clone).join(name_with_true_ext.clone());
+                if (&args.replace_existing).clone() || !output_path_true.exists() {
+                    info!("Downloading {}", &episode_clone.title);
+                    let resp = client.get(episode.url).send().await?;
+                    let data = match resp.bytes().await {
+                        Ok(data) => data,
+                        Err(e) => return Err(e)
+                    };
+                    return Ok((episode_clone, data))
+                }
+                
+                info!("Skipping {}; {}/{} exists", &episode.title, &output_dir_clone, &name_with_true_ext);
+                let empty: Bytes = Bytes::new();
+                Ok((episode_clone, empty))
             })
         })
         .buffer_unordered(args.task_count);
@@ -83,7 +124,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     bodies
         .for_each(|b| async {
             match b {
-                Ok(Ok(b)) => {info!("Got {} bytes", b.1.len())},
+                Ok(Ok(b)) => {
+                    let episode = b.0;
+                    let data = b.1;
+                    debug!("Got {} bytes", data.len());
+                    
+                    if data.len() == 0 {
+                        return
+                    }
+
+                    let (name_with_part_ext, name_with_true_ext) = episode_to_filename(&episode);
+
+                    let output_path_tmp = Path::new(&args.output_dir).join(name_with_part_ext);
+                    let output_path_true = Path::new(&args.output_dir).join(name_with_true_ext.clone());
+
+                    if (&args.replace_existing).clone() || !output_path_true.exists() {
+                        info!("{} --> {}/{}", &episode.title, &args.output_dir, &name_with_true_ext);
+                        let file = File::options()
+                            .write(true)
+                            .create(true)
+                            .open(&output_path_tmp);
+                        let mut file = match file {
+                            Ok(file) => file,
+                            Err(e) => {
+                                error!("Got I/O error: {}", e);
+                                return
+                            }
+                        };
+
+                        if let Err(e) = file.write(&data) {
+                            error!("Failed to write to {}. Error: {}", &output_path_tmp.to_str().unwrap(), e);
+                        }
+
+                        if let Err(e) = fs::rename(&output_path_tmp, output_path_true) {
+                            error!("Failed to move to {}. Error: {}", &output_path_tmp.to_str().unwrap(), e);
+                        }
+                    }
+                    else {
+                        info!("Skipping {}; {}/{} exists", &episode.title, &args.output_dir, &name_with_true_ext);
+                    }
+                },
                 Ok(Err(e)) => error!("Got a reqwest::Error: {}", e),
                 Err(e) => error!("Got a tokio::JoinError: {}", e),
             }
@@ -91,6 +171,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
 
     Ok(())
+}
+
+fn episode_to_filename(episode: &Episode) -> (String, String) {
+    let name = episode.title
+        .replace(" ", "_")
+        .replace(":", "-")
+        .replace("/", "-")
+        .replace("\"", "")
+        .replace("\'", "")
+        .replace("*", "a");
+
+    let name_with_part_ext = episode.datetime.timestamp().to_string() + "-" + &name.clone() + ".part";
+    let name_with_true_ext = episode.datetime.timestamp().to_string() + "-" + &name.clone() + ".mp3";
+
+    (name_with_part_ext, name_with_true_ext)
 }
 
 fn init_logging(use_syslog: bool) {
